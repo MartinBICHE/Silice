@@ -29,6 +29,7 @@ void clear_audio()
 
 void main()
 {
+  int amplitude = 128;
   // install putchar handler for printf
   f_putchar = display_putchar;
 
@@ -72,10 +73,22 @@ void main()
     int dir  = 0;
     // plays the entire file
     while (1) {
+      if (*BUTTONS & (1<<5)) {
+        amplitude = amplitude - 1;
+      }
+      if (*BUTTONS & (1<<6)) {
+        amplitude = amplitude + 1;
+      }
       // read directly in hardware buffer
       int *addr = (int*)(*AUDIO);
       // (use 512 bytes reads to avoid extra copies inside fat_io_lib)
-      int sz = fl_fread(addr,1,512,f);
+      // int sz = fl_fread(addr,1,512,f);
+      uint8 tmp[512];
+      int sz = fl_fread(tmp,1,512,f);
+      for (int i=0; i<sz; ++i) {
+          tmp[i] = (tmp[i] * amplitude) >> 8;  // amplitude 0..255
+      }
+      memcpy(addr, tmp, sz);
       if (sz < 512) break; // reached end of file
       // wait for buffer swap
       while (addr == (int*)(*AUDIO)) { }

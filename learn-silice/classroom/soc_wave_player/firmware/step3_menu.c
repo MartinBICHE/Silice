@@ -10,6 +10,14 @@
 
 #define N_ITEMS 5
 
+// #define MAX_STRLEN 64
+
+//   char file_list[N_ITEMS][MAX_STRLEN];
+
+//   void main(){
+//     strcpy(file_list[2],"blabla.txt");
+//   }
+
   const char *items[N_ITEMS] = {
     "the sound of silence",
     "sunday bloody sunday",
