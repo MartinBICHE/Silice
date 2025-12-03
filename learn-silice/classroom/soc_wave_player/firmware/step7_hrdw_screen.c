@@ -15,6 +15,38 @@
 #error This firmware needs HWFBUFFER defined
 #endif
 
+#define PAUSE_W 128
+#define PAUSE_H 128
+
+uint8 pause_buf[PAUSE_W * PAUSE_H];
+
+  void draw_pause_icon(int x0, int y0) {
+    FL_FILE *h = fl_fopen("/pause.raw", "rb");
+    if (h == NULL)
+        return;
+
+    fl_fread(pause_buf, 1, PAUSE_W * PAUSE_H, h);
+    fl_fclose(h);
+
+    uint8 *fb = (uint8*) display_framebuffer();
+
+    for (int y = 0; y < PAUSE_H; ++y) {
+        for (int x = 0; x < PAUSE_W; ++x) {
+            uint8 pix = pause_buf[y * PAUSE_W + x];
+
+            // couleur 255 = transparent (on ne touche pas au fond)
+            if (pix != 255) {
+                int fx = x0 + x;
+                int fy = y0 + y;
+                fb[fy * 128 + fx] = pix;
+            }
+        }
+    }
+
+    display_refresh();
+}
+
+
 void clear_audio()
 {
   // wait for a buffer swap (sync)
@@ -106,6 +138,18 @@ void main()
       }
       if (just_pressed & (1<<1)) {
         paused = !paused;
+        if (paused){
+          clear_audio();
+          draw_pause_icon(0,0);
+        } else {
+          // on revient au fond
+          FL_FILE *g = fl_fopen("/music.raw.raw","rb");
+          if (g != NULL) {
+              fl_fread(display_framebuffer(),1,128*128,g);
+              display_refresh();
+              fl_fclose(g);
+          }
+        }
       }
 
       if (paused) {
