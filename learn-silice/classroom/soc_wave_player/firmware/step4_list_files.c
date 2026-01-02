@@ -9,7 +9,7 @@
 #include "printf.h"
 #include "sdcard.h"
 
-#define N_ITEMS 7
+#define N_ITEMS 2
 
 // include the fat32 library
 #include "fat_io_lib/src/fat_filelib.h"
