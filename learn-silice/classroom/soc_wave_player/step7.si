@@ -79,6 +79,7 @@ $$end
   output uint1 oled_dc,
   output uint1 oled_resn,
   output uint1 oled_csn(0),
+  uint1 audio_enable(0),
 $$if VERILATOR then
   // configuration for SPIscreen simulation
   output uint2  spiscreen_driver(1/*SSD1351*/),

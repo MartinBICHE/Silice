@@ -14,11 +14,13 @@
 // Boutons et leurs fonctionnalités
 // =========================================================
 #define BTN1 (1<<1)   // Musique : PAUSE || Menu : ... 
-#define BTN2 (1<<2)   // Musique : STOP (retour Menu) || Menu : SELECT
-#define BTN3 (1<<3)   // Musique : ... || Menu : UP
-#define BTN4 (1<<4)   // Musique : ... || Menu : DOWN
-#define BTN_VOL_DOWN (1<<5) // Musique : DIMINUE VOLUME || Menu : ...
-#define BTN_VOL_UP   (1<<6) // Musique : AUGMENTE VOLUME || Menu : ...
+#define BTN2 (1<<2)   // Musique : STOP (retour Menu) || Menu : ...
+#define BTN3 (1<<3)   // Musique : AUGMENTE VOLUME || Menu : UP
+#define BTN4 (1<<4)   // Musique : DIMINUE VOLUME || Menu : DOWN
+#define BTN5 (1<<5)   // Musique : - Appui court : CHANSON PRÉCÉDENTE DU MÊME FICHIER || Menu : RETOUR DOSSIER PARENT
+                      //           - Appui long : CHANSON ACCÉLÉRER VERS LE DÉBUT
+#define BTN6 (1<<6)   // Musique : - Appui court : CHANSON SUIVANTE DU MÊME FICHIER || Menu : SELECTIONNER DOSSIER OU FICHIER
+                      //           - Appui long : CHANSON ACCÉLÉRER VERS LA FIN
 
 // =========================================================
 // UI / limites
@@ -48,10 +50,8 @@ static int   pause_loaded = 0;
 static int vol_led_blocks_left = 0; // Compteur qui permet de switché entre l'affichage de l'animation volume et l'animation musique des LEDS
 static int vu_level = 0; // Mémoriser et lisser le niveau audio
 
-
 // ==================================================================================================================
 // ==================================================================================================================
-
 
 // =========================================================
 // Mini string helpers (sans libc)
@@ -234,7 +234,7 @@ static int read_buttons_debounced(void) {
   int v = 0;
   for (int bit = 0; bit < 7; ++bit) {
     int m = ((b0>>bit)&1) + ((b1>>bit)&1) + ((b2>>bit)&1) + ((b3>>bit)&1) + ((b4>>bit)&1);
-    if (m >= 1) v |= (1<<bit); // Majorité obtenu à 1 vote
+    if (m >= 3) v |= (1<<bit); // Majorité obtenu à 1 vote
   }
   return v;
 }
@@ -288,6 +288,16 @@ static void draw_pause_icon(int x0, int y0) {
 // Audio helpers 
 // =========================================================
 
+static uint32 align_down_512(uint32 x) { return x & ~511u; }
+
+static uint32 u32_min(uint32 a, uint32 b) { return (a < b) ? a : b; }
+
+static void file_seek_to(FL_FILE *f, uint32 pos) {
+  // fat_filelib propose en général fl_fseek / fl_ftell selon version.
+  // On suppose que fl_fseek existe chez toi.
+  fl_fseek(f, pos, SEEK_SET);
+}
+
 // Créer du silence lorsque la musique est mise en pause ou lorsqu'on sort du mode musique pour retourner dans le mode menu
 static void clear_audio(void) {
   int *addr = (int*)(*AUDIO);
@@ -309,6 +319,15 @@ static int fread_fill512(FL_FILE *f, uint8 *buf) {
   }
   if (got < 512) memset(buf + got, 128, 512 - got);
   return got;
+}
+
+#define AUDIO_BASE_ADDR   0x00018000u
+#define AUDIO_CTRL_OFFSET (1u << 8)
+#define AUDIO_CTRL_ADDR   (AUDIO_BASE_ADDR + (AUDIO_CTRL_OFFSET * 4u))
+#define AUDIO_CTRL        ((volatile uint32*)AUDIO_CTRL_ADDR)
+
+static inline void audio_enable_hw(int on) {
+  AUDIO_CTRL[0] = (on ? 1u : 0u);
 }
 
 // =========================================================
@@ -374,17 +393,6 @@ static void scan_dir_build_view(const char *cwd) {
   int want_start = scroll;
   int want_end   = scroll + VIEW_ITEMS;
 
-  // Insérer ".." si nécessaire
-  if (has_up) {
-    if (0 >= want_start && 0 < want_end) {
-      Entry *en = &view[view_count++];
-      str_cpy_max(en->name, "..", NAME_MAX);
-      en->is_dir = 1;
-      en->size   = 0;
-      en->is_up  = 1;
-    }
-  }
-
   if (!fl_opendir(cwd, &d)) return;
 
   // Remplir view avec les bons éléments
@@ -423,12 +431,10 @@ static void draw_browser(const char *cwd, int pulse) {
     if (global_idx == selected) display_set_front_back_color(0,255);
     else                        display_set_front_back_color(255,0);
 
-    if (view[i].is_up) {
-      printf("[UP ] ..\n");
-    } else if (view[i].is_dir) {
+    if (view[i].is_dir) {
       printf("[DIR] %s\n", view[i].name);
     } else {
-      printf("      %s\n", view[i].name);
+      printf("[SND] %s\n", view[i].name);
     }
   }
 
@@ -457,9 +463,89 @@ static void show_image_for_audio(const char *audio_path) {
   display_refresh();
 }
 
-static void play_audio_with_ui(const char *audio_path) {
+typedef enum {
+  PLAYER_STOP = 0,   // retour menu
+  PLAYER_NEXT = 1,   // piste suivante
+  PLAYER_PREV = 2,   // piste précédente
+  PLAYER_END  = 3    // fin de fichier
+} PlayerAction;
+
+// Extrait le dossier parent + le nom de fichier depuis un chemin absolu
+static void path_split_dir_file(const char *full, char dir_out[PATH_MAX], char file_out[NAME_MAX]) {
+  int n = str_len_max(full, PATH_MAX);
+  if (n <= 0) { dir_out[0] = '/'; dir_out[1] = 0; file_out[0] = 0; return; }
+
+  int last_slash = -1;
+  for (int i=0; i<n; ++i) if (full[i] == '/') last_slash = i;
+
+  if (last_slash <= 0) {
+    dir_out[0] = '/'; dir_out[1] = 0;
+    str_cpy_max(file_out, (full[0] == '/') ? full+1 : full, NAME_MAX);
+  } else {
+    // dir = full[0..last_slash-1]
+    int dlen = last_slash;
+    if (dlen >= PATH_MAX) dlen = PATH_MAX-1;
+    for (int i=0; i<dlen; ++i) dir_out[i] = full[i];
+    dir_out[dlen] = 0;
+    str_cpy_max(file_out, full + last_slash + 1, NAME_MAX);
+  }
+}
+
+// Donne le prochain (ou précédent) fichier audio visible dans le même dossier.
+// Retourne 1 si trouvé, 0 sinon.
+static int find_next_prev_audio_in_dir(const char *dir, const char *cur_file, int direction,
+                                      char out_full[PATH_MAX]) {
+  // direction: +1 next, -1 prev
+  // On cherche le "prochain visible .raw" dans l'ordre de fl_readdir.
+  // Sans tri: c'est stable (ordre FS), mais pas alphabétique.
+  // (Si tu veux alphabétique, faudra bufferiser + trier.)
+
+  FL_DIR d;
+  if (!fl_opendir(dir, &d)) return 0;
+
+  // On récupère les candidats .raw visibles
+  // On limite à 128 fichiers max pour éviter gros buffer.
+  #define MAX_TRACKS 128
+  char tracks[MAX_TRACKS][NAME_MAX];
+  int count = 0;
+
+  struct fs_dir_ent e;
+  while (fl_readdir(&d, &e) == 0) {
+    if (e.is_dir) continue;
+    if (!is_visible_file(e.filename)) continue;
+    if (!ends_with(e.filename, ".raw")) continue; // uniquement tes musiques
+    if (count < MAX_TRACKS) {
+      str_cpy_max(tracks[count], e.filename, NAME_MAX);
+      count++;
+    }
+  }
+  fl_closedir(&d);
+
+  if (count <= 0) return 0;
+
+  // trouver l'index du fichier courant
+  int idx = -1;
+  for (int i=0; i<count; ++i) {
+    if (streq(tracks[i], cur_file)) { idx = i; break; }
+  }
+  if (idx < 0) {
+    // si pas trouvé, on prend le premier
+    idx = 0;
+  }
+
+  int next = idx + direction;
+  if (next < 0) next = count - 1;     // wrap
+  if (next >= count) next = 0;        // wrap
+
+  path_join(out_full, dir, tracks[next]);
+  return 1;
+}
+
+static PlayerAction play_audio_with_ui(const char *audio_path) {
   int amplitude = 128; // Volume de départ 
   int paused = 0;
+
+  uint32 file_pos = 0;
 
   amplitude = clampi(amplitude, VOL_MIN, VOL_MAX);
 
@@ -475,9 +561,12 @@ static void play_audio_with_ui(const char *audio_path) {
     display_set_front_back_color(255,0);
     printf("Audio introuvable:\n%s\n", audio_path);
     display_refresh();
-    return;
+    audio_enable_hw(0);
+    return PLAYER_STOP;
   }
+  file_pos = 0;
 
+  audio_enable_hw(1);
   clear_audio(); // Permet de démarrer l'audio proprement
 
   int prev_buttons = 0; // Permet de détecter just_pressed
@@ -487,7 +576,20 @@ static void play_audio_with_ui(const char *audio_path) {
   // Jouer du silence lorsque le musique est en pause 
   static uint8 silence[512];
   static int silence_init = 0;
-  if (!silence_init) { memset(silence, 128, 512); silence_init = 1; }
+  if (!silence_init) { 
+    memset(silence, 128, 512); silence_init = 1; 
+  }
+
+  // Chercher dans le fichier au maintient de BTN6 ou BTN5
+  #define SEEK_BLOCKS_STEP_BASE  8
+  #define SEEK_TICK_DIV          4
+  #define SEEK_LONGPRESS_TICKS   25
+
+  int seek_tick = 0;
+  int b5_hold = 0;
+  int b6_hold = 0;
+  int b5_hold_prev = 0;
+  int b6_hold_prev = 0;
 
   while (1) {
     // Évite que l'appuie long fasse n'importe quoi 
@@ -500,7 +602,10 @@ static void play_audio_with_ui(const char *audio_path) {
       clear_audio();
       memset((void*)display_framebuffer(), 0x00, 128*128);
       display_refresh();
-      break;
+      fl_fclose(f);
+      *LEDS = 0;
+      audio_enable_hw(0);
+      return PLAYER_STOP;
     }
 
     // Affichage pause
@@ -508,21 +613,95 @@ static void play_audio_with_ui(const char *audio_path) {
       paused = !paused;
       if (paused) {
         clear_audio();
+        audio_enable_hw(0);
+        *LEDS = 0;
         draw_pause_icon(0,0);
       } else {
+        audio_enable_hw(1);
+        clear_audio();
         show_image_for_audio(audio_path);
+      }
+    }
+
+    // Gestion de l'audio en pause
+    if (paused) {
+      volume_led_tick();
+      if (vol_led_blocks_left == 0) *LEDS = 0;
+
+      tiny_delay(200); // évite de tourner à fond CPU
+      continue;
+    }
+
+    // Chercher dans le fichier au maintient de BTN6 ou BTN5
+    int b5_down = (buttons & BTN5) != 0;
+    int b6_down = (buttons & BTN6) != 0;
+
+    b5_hold_prev = b5_hold;
+    b6_hold_prev = b6_hold;
+
+    if (b5_down) b5_hold++; else b5_hold = 0;
+    if (b6_down) b6_hold++; else b6_hold = 0;
+
+    int seeking = 0;
+    int seek_dir = 0;
+
+    if (b6_down && b6_hold >= SEEK_LONGPRESS_TICKS) { seeking = 1; seek_dir = +1; }
+    if (b5_down && b5_hold >= SEEK_LONGPRESS_TICKS) { seeking = 1; seek_dir = -1; }
+    if (b5_down && b6_down) { seeking = 0; seek_dir = 0; }
+
+    if (seeking) {
+      seek_tick++;
+      if ((seek_tick % SEEK_TICK_DIV) == 0) {
+        uint32 blocks = SEEK_BLOCKS_STEP_BASE;
+        int h = (seek_dir > 0) ? b6_hold : b5_hold;
+
+        if (h > 60)  blocks = 32;
+        if (h > 140) blocks = 128;
+
+        uint32 step = blocks * 512u;
+        uint32 new_pos = file_pos;
+
+        if (seek_dir > 0) {
+          new_pos = file_pos + step;
+        } else {
+          new_pos = (file_pos > step) ? (file_pos - step) : 0;
+        }
+
+        new_pos = align_down_512(new_pos);
+        file_seek_to(f, new_pos);
+        file_pos = new_pos;
+
+        clear_audio();
+      }
+    } else {
+      seek_tick = 0;
+
+      if (!b5_down && (b5_hold_prev > 0) && (b5_hold_prev < SEEK_LONGPRESS_TICKS)) {
+        clear_audio();
+        fl_fclose(f);
+        *LEDS = 0;
+        audio_enable_hw(0);
+        return PLAYER_PREV;
+      }
+
+      if (!b6_down && (b6_hold_prev > 0) && (b6_hold_prev < SEEK_LONGPRESS_TICKS)) {
+        clear_audio();
+        fl_fclose(f);
+        *LEDS = 0;
+        audio_enable_hw(0);
+        return PLAYER_NEXT;
       }
     }
 
     // Gestion du volume pour l'instant il n'y a que le début qui est utile
     // Comme dit la partie permettant d'accélerer le changement de volume n'est pas opérationel
     int dir = 0;
-    if (buttons & BTN_VOL_DOWN) dir = -1;
-    if (buttons & BTN_VOL_UP)   dir = +1;
-    if ((buttons & BTN_VOL_DOWN) && (buttons & BTN_VOL_UP)) dir = 0;
+    if (buttons & BTN4) dir = -1;
+    if (buttons & BTN3)   dir = +1;
+    if ((buttons & BTN4) && (buttons & BTN3)) dir = 0;
 
-    int vol_just_down = just_pressed & BTN_VOL_DOWN;
-    int vol_just_up   = just_pressed & BTN_VOL_UP;
+    int vol_just_down = just_pressed & BTN4;
+    int vol_just_up   = just_pressed & BTN3;
 
     int changed = 0;
 
@@ -552,20 +731,10 @@ static void play_audio_with_ui(const char *audio_path) {
     // Affichage du volume sur les LEDS
     if (changed) volume_led_show_now(amplitude);
 
-    // Gestion de l'audio en pause
-    if (paused) {
-      int *addr = (int*)(*AUDIO);
-      memcpy(addr, silence, 512);
-      while (addr == (int*)(*AUDIO)) { }
-
-      volume_led_tick();
-      if (vol_led_blocks_left == 0) *LEDS = 0;
-      continue;
-    }
-
     int *addr = (int*)(*AUDIO);
     uint8 tmp[512];
     int sz = fread_fill512(f, tmp);
+    file_pos += (uint32)sz;
 
     for (int i=0; i<512; ++i) {
       int s = (int)tmp[i] - 128;
@@ -586,7 +755,12 @@ static void play_audio_with_ui(const char *audio_path) {
 
     if (sz < 512) {
       clear_audio();
-      break;
+      memset((void*)display_framebuffer(), 0x00, 128*128);
+      display_refresh();
+      fl_fclose(f);
+      *LEDS = 0;
+      audio_enable_hw(0);
+      return PLAYER_END;
     }
 
     while (addr == (int*)(*AUDIO)) { }
@@ -594,6 +768,8 @@ static void play_audio_with_ui(const char *audio_path) {
 
   fl_fclose(f);
   *LEDS = 0;
+  audio_enable_hw(0);
+  return PLAYER_STOP;
 }
 
 // =========================================================
@@ -627,6 +803,8 @@ void main(void) {
   int dirty = 1;
   int pulse_tick = 0;
 
+  audio_enable_hw(0);
+
   // Menu interactif
   while (1) {
     if (dirty) {
@@ -650,20 +828,11 @@ void main(void) {
         if (selected >= total_count) selected = total_count - 1;
 
         // Sélection
-        if (just_pressed & BTN2) {
+        if (just_pressed & BTN6) {
           display_refresh();
           int local = selected - scroll;
           memset((void*)display_framebuffer(), 0x00, 128*128);
           if (local >= 0 && local < view_count) {
-            // Retourner dans le dossier parent 
-            if (view[local].is_up) {
-              path_parent(cwd);
-              selected = 0;
-              scroll = 0;
-              dirty = 1;
-              break;
-            }
-
             char full[PATH_MAX];
             path_join(full, cwd, view[local].name);
 
@@ -675,15 +844,52 @@ void main(void) {
               dirty = 1;
               break;
             } else { // Lire l'audio correspondant au fichier selectionné
-              play_audio_with_ui(full);
+              char cur_full[PATH_MAX];
+              str_cpy_max(cur_full, full, PATH_MAX);
+
+              while (1) {
+                PlayerAction act = play_audio_with_ui(cur_full);
+
+                if (act == PLAYER_STOP || act == PLAYER_END) {
+                  break; // retour au menu
+                }
+
+                // act == NEXT/PREV -> calculer le prochain fichier dans le même dossier
+                char dir[PATH_MAX];
+                char file[NAME_MAX];
+                path_split_dir_file(cur_full, dir, file);
+
+                char next_full[PATH_MAX];
+                int ok = find_next_prev_audio_in_dir(dir, file, (act == PLAYER_NEXT) ? +1 : -1, next_full);
+
+                if (!ok) {
+                  break; // rien à jouer
+                }
+
+                str_cpy_max(cur_full, next_full, PATH_MAX);
+              }
+
+              audio_enable_hw(0);
               dirty = 1;
               break;
             }
           }
+        } else if (just_pressed & BTN5) {
+          display_refresh();
+          int local = selected - scroll;
+          memset((void*)display_framebuffer(), 0x00, 128*128);
+          if (local >= 0 && local < view_count) {
+            // Retourner dans le dossier parent 
+            path_parent(cwd);
+            selected = 0;
+            scroll = 0;
+            dirty = 1;
+            break;
+          }
         }
       }
 
-      tiny_delay(40);
+      tiny_delay(10);
     }
     
     // Animation repris de step3 si je ne dis pas de bêtise qui fait clignoter le titre qui d'ailleurs n'est plus opérationnel à ce que je vois
