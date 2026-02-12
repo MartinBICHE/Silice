@@ -3,7 +3,7 @@
 
 Ce projet présente un lecteur audio capable de lire des fichiers depuis une carte SD avec une interface visuelle sur écran OLED et une gestion dynamique des LEDs.
 
-### Fonctionnalites implementees
+### Fonctionnalités implémentées
 
 - Avance et retour accéléré dans les morceaux de musique.
 - Animation des LEDs synchronisée avec la musique (VU-metre).
